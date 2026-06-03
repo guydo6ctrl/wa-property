@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Lot map — click for R-code</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+        integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="">
+  <style>
+    html, body, #map { height: 100%; margin: 0; }
+    #panel {
+      position: absolute; top: 12px; right: 12px; z-index: 1000;
+      background: rgba(255,255,255,0.94); padding: 8px 12px; border-radius: 6px;
+      font: 13px/1.4 system-ui, sans-serif; box-shadow: 0 1px 4px rgba(0,0,0,0.2);
+      max-width: 260px;
+    }
+    #panel h1 { font-size: 14px; margin: 0 0 4px 0; }
+    .legend { display: grid; grid-template-columns: 16px auto; gap: 4px 8px; margin-top: 6px; }
+    .swatch { width: 14px; height: 14px; border: 1px solid #444; }
+  </style>
+</head>
+<body>
+  <div id="panel">
+    <h1>Lots (click for R-code)</h1>
+    <div id="summary"><small>Zoom in further to load lots.</small></div>
+    <div class="legend" id="legend"></div>
+  </div>
+  <div id="map"></div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+          integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+  <script>
+    // Read optional URL params for jump-from-admin:
+    //   ?focus_lat=…&focus_lng=…&focus_label=…           — single listing
+    //   ?cluster_points=lat,lng;lat,lng&cluster_labels=A|B&cluster_name=…  — cluster
+    const qs = new URLSearchParams(window.location.search);
+    const focusLat = parseFloat(qs.get('focus_lat'));
+    const focusLng = parseFloat(qs.get('focus_lng'));
+    const focusLabel = qs.get('focus_label') || '';
+    const focused = !isNaN(focusLat) && !isNaN(focusLng);
+
+    const clusterPointsRaw = qs.get('cluster_points') || '';
+    const clusterPoints = clusterPointsRaw
+      ? clusterPointsRaw.split(';').map(s => s.split(',').map(parseFloat))
+                        .filter(p => p.length === 2 && !isNaN(p[0]) && !isNaN(p[1]))
+      : [];
+    const clusterLabels = (qs.get('cluster_labels') || '').split('|');
+    const clusterName = qs.get('cluster_name') || '';
+    const isCluster = clusterPoints.length >= 2;
+
+    const map = L.map('map').setView(
+      focused ? [focusLat, focusLng]
+              : (isCluster ? clusterPoints[0] : [-31.985, 115.785]),
+      focused ? 18 : 15,
+    );
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      attribution: '© OpenStreetMap contributors',
+      maxZoom: 19,
+    }).addTo(map);
+
+    if (focused) {
+      L.marker([focusLat, focusLng])
+        .addTo(map)
+        .bindPopup(`<b>${focusLabel || 'Selected listing'}</b>`)
+        .openPopup();
+    }
+
+    let clusterBounds = null;
+    if (isCluster) {
+      clusterBounds = L.latLngBounds(clusterPoints);
+      clusterPoints.forEach((p, i) => {
+        L.marker(p).addTo(map)
+          .bindPopup(`<b>${clusterLabels[i] || `Member ${i+1}`}</b><br><small>${clusterName}</small>`);
+      });
+      map.fitBounds(clusterBounds, { padding: [40, 40], maxZoom: 18 });
+    }
+
+    // Highlight predicates: lot polygon contains a focus point or any cluster point.
+    const highlightPoints = isCluster ? clusterPoints
+                           : (focused ? [[focusLat, focusLng]] : []);
+
+    const codeColour = (code) => {
+      const m = (code || '').match(/R([0-9.]+)/);
+      const n = m ? parseFloat(m[1]) : 0;
+      if (!code) return '#999';
+      if (n < 15)   return '#ffffd9';
+      if (n < 25)   return '#c7e9b4';
+      if (n < 35)   return '#7fcdbb';
+      if (n < 55)   return '#41b6c4';
+      if (n < 85)   return '#1d91c0';
+      if (n < 150)  return '#225ea8';
+      return '#0c2c84';
+    };
+
+    document.getElementById('legend').innerHTML = [
+      ['R5–R12.5', '#ffffd9'], ['R15–R20', '#c7e9b4'], ['R25–R30', '#7fcdbb'],
+      ['R35–R50', '#41b6c4'], ['R60–R80', '#1d91c0'], ['R100–R160', '#225ea8'],
+      ['R200+', '#0c2c84'], ['no R-code', '#999'],
+    ].map(([label, col]) =>
+      `<div class="swatch" style="background:${col}"></div><div>${label}</div>`
+    ).join('');
+
+    let layer = null;
+    let lastReq = 0;
+
+    const refresh = () => {
+      const b = map.getBounds();
+      const bbox = [b.getWest(), b.getSouth(), b.getEast(), b.getNorth()].join(',');
+      const reqId = ++lastReq;
+      fetch(`/lots.geojson?bbox=${bbox}`)
+        .then(r => r.json())
+        .then(fc => {
+          if (reqId !== lastReq) return;  // stale response, ignore
+          if (layer) map.removeLayer(layer);
+          if (fc.meta && fc.meta.message) {
+            document.getElementById('summary').innerHTML = `<small>${fc.meta.message}</small>`;
+            return;
+          }
+          // Highlight the lot whose polygon contains the focused point.
+          const pointInRing = (lat, lng, ring) => {
+            let inside = false;
+            for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+              const [xi, yi] = ring[i], [xj, yj] = ring[j];
+              const intersect = ((yi > lat) !== (yj > lat)) &&
+                                (lng < (xj - xi) * (lat - yi) / (yj - yi + 1e-12) + xi);
+              if (intersect) inside = !inside;
+            }
+            return inside;
+          };
+          const isFocused = (f) => {
+            if (!highlightPoints.length) return false;
+            const g = f.geometry;
+            const polys = g.type === 'Polygon' ? [g.coordinates] : g.coordinates;
+            for (const [lat, lng] of highlightPoints) {
+              for (const poly of polys) {
+                if (pointInRing(lat, lng, poly[0])) return true;
+              }
+            }
+            return false;
+          };
+
+          layer = L.geoJSON(fc, {
+            style: (f) => isFocused(f) ? ({
+              color: '#d63b3b', weight: 3,
+              fillColor: codeColour(f.properties.r_code),
+              fillOpacity: 0.85,
+            }) : ({
+              color: '#222', weight: 0.5,
+              fillColor: codeColour(f.properties.r_code),
+              fillOpacity: 0.6,
+            }),
+            onEachFeature: (f, l) => {
+              const p = f.properties;
+              const code = p.r_code || '(none)';
+              const area = p.area_sqm ? `${p.area_sqm.toLocaleString()} m²` : '—';
+              l.bindPopup(
+                `<b>${p.address || 'no address'}</b><br>` +
+                `R-code: <b>${code}</b><br>` +
+                `Area: ${area}<br>` +
+                `<small>land_id ${p.landgate_id}</small>`
+              );
+            },
+          }).addTo(map);
+          document.getElementById('summary').innerHTML =
+            `<b>${fc.features.length}</b> lots in view${fc.features.length >= 5000 ? ' (capped)' : ''}`;
+        });
+    };
+
+    map.on('moveend', refresh);
+    refresh();
+  </script>
+</body>
+</html>
