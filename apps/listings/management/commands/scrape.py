@@ -37,16 +37,20 @@ class Command(BaseCommand):
         n_total = 0
         n_created = 0
         n_errors = 0
+        n_reaped = 0
         with client:
             for suburb in suburbs:
                 self.stdout.write(self.style.NOTICE(f'== {suburb} =='))
                 suburb_count = 0
+                seen_source_ids: set[str] = set()
+                suburb_failed = False
                 try:
                     for parsed in reiwa.scrape_suburb(
                         suburb, client=client, max_pages=opts['max_pages'], on_error=on_error,
                     ):
                         n_total += 1
                         suburb_count += 1
+                        seen_source_ids.add(parsed.source_id)
                         fields = dataclasses.asdict(parsed)
                         fields.pop('source_id')
                         fields['raw'] = {}
@@ -65,9 +69,26 @@ class Command(BaseCommand):
                             on_error('save', parsed.url, e)
                 except Exception as e:
                     n_errors += 1
+                    suburb_failed = True
                     self.stderr.write(self.style.ERROR(f'  !! suburb {suburb!r} aborted: {type(e).__name__}: {e}'))
+
+                # Reap stale listings only if this suburb completed cleanly and we
+                # got a sane number of results — guards against silent reiwa errors
+                # that would otherwise mass-delete active listings.
+                if not suburb_failed and len(seen_source_ids) >= 5:
+                    reaped = (Listing.objects
+                              .filter(source=Listing.SOURCE_REIWA,
+                                      suburb__iexact=suburb,
+                                      status=Listing.STATUS_ACTIVE)
+                              .exclude(source_id__in=seen_source_ids)
+                              .update(status=Listing.STATUS_GONE,
+                                      last_seen=timezone.now()))
+                    if reaped:
+                        n_reaped += reaped
+                        self.stdout.write(f'   reaped {reaped} stale listings in {suburb}')
+
                 self.stdout.write(self.style.NOTICE(f'   ({suburb_count} from {suburb})'))
 
         self.stdout.write(self.style.SUCCESS(
-            f'Done. {n_total} listings, {n_created} new, {n_errors} errors.'
+            f'Done. {n_total} listings, {n_created} new, {n_reaped} reaped, {n_errors} errors.'
         ))

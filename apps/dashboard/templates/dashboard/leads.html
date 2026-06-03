@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Leads — active adjacent listings</title>
+<style>
+  body { font: 14px/1.4 -apple-system, system-ui, sans-serif; margin: 24px; color: #222; }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  .sub { color: #888; margin: 0 0 24px; }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid #eee; vertical-align: top; }
+  th { font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; color: #666; }
+  tr:hover { background: #fafafa; }
+  .members { line-height: 1.6; }
+  .member { display: block; }
+  .member a { color: #1e6fdf; text-decoration: none; }
+  .member a:hover { text-decoration: underline; }
+  .price { color: #666; margin-left: 8px; }
+  .mixed { color: #c66; font-weight: 600; }
+  .days-new { color: #1e7f3e; font-weight: 600; }
+  .days-old { color: #888; }
+  .gain-pos { color: #1e7f3e; font-weight: 600; }
+  .gain-zero { color: #888; }
+  .empty { color: #888; font-style: italic; padding: 40px; text-align: center; }
+</style>
+</head>
+<body>
+<h1>Leads</h1>
+<p class="sub">
+  {{ total_clusters }} cluster{{ total_clusters|pluralize }} from {{ total_listings }} active listings · sorted by newest member
+</p>
+
+{% if clusters %}
+<table>
+  <thead>
+    <tr>
+      <th>Suburb</th>
+      <th>Members</th>
+      <th>Combined area</th>
+      <th>R-code</th>
+      <th>Yield gain</th>
+      <th>Days new</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for c in clusters %}
+    <tr>
+      <td>{{ c.suburb }}</td>
+      <td class="members">
+        {% for m in c.members %}
+          <span class="member">
+            <a href="{{ m.url }}" target="_blank" rel="noopener">{{ m.address_short }}</a>
+            <span class="price">{{ m.price_text }}</span>
+          </span>
+        {% endfor %}
+      </td>
+      <td>{{ c.total_area }} m²</td>
+      <td>
+        {{ c.rcode_label }}
+        {% if c.rcode_mixed %}<span class="mixed">·mixed</span>{% endif %}
+      </td>
+      <td>
+        {% if c.gain == '—' %}
+          <span class="gain-zero">—</span>
+        {% else %}
+          {% if '+0' in c.gain %}
+            <span class="gain-zero">{{ c.gain }}</span>
+          {% else %}
+            <span class="gain-pos">{{ c.gain }}</span>
+          {% endif %}
+        {% endif %}
+      </td>
+      <td>
+        {% if c.days_new < 7 %}
+          <span class="days-new">{{ c.days_new }}d</span>
+        {% else %}
+          <span class="days-old">{{ c.days_new }}d</span>
+        {% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="empty">No clusters. Run <code>manage.py scrape</code>, <code>match_lots</code>, then refresh.</p>
+{% endif %}
+</body>
+</html>

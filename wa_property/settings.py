@@ -20,6 +20,7 @@ INSTALLED_APPS = [
     'apps.listings',
     'apps.zoning',
     'apps.cadastre',
+    'apps.dashboard',
 ]
 
 MIDDLEWARE = [
