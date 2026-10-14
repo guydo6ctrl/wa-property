@@ -11,6 +11,12 @@ from .common import PoliteClient
 
 BASE = 'https://reiwa.com.au'
 SEARCH_URL = BASE + '/for-sale/{suburb}/'
+
+# Stop a suburb after this many search pages fail in a row. Without it, a suburb
+# with no valid reiwa page (e.g. a fringe locality that only bled in via a
+# neighbour's listing) or a 403 block grinds through all max_pages pages hammering
+# errors — wasting requests and provoking the very block it's hitting.
+MAX_CONSECUTIVE_SEARCH_FAIL = 3
 SLUG_RE = re.compile(r'^/[a-z0-9][a-z0-9-]+-(\d{6,})/$')
 SOURCE_ID_FROM_URL = re.compile(r'-(\d{6,})/$')
 
@@ -150,9 +156,29 @@ def scrape_suburb(
     client: PoliteClient | None = None,
     max_pages: int = 50,
     on_error=None,
+    outcome: dict | None = None,
 ) -> Iterator[ParsedListing]:
     """Yield parsed listings for a suburb. Resilient: per-page and per-listing failures
-    are reported via on_error(stage, url, exc) and skipped instead of aborting."""
+    are reported via on_error(stage, url, exc) and skipped instead of aborting.
+
+    The caller may pass a mutable `outcome` dict; once the generator is exhausted it
+    holds the integrity signals the `delist` sweep depends on:
+      - reached_terminal: True only if we hit a genuine no-next-page end (not a
+        max_pages cutoff and not a pagination parse failure).
+      - search_errors: failed/garbled *search* pages — each is a whole batch of
+        listings missing from this run, so any of these makes the run untrustworthy.
+      - detail_errors: failed *detail* pages — one listing each (the grace counter
+        absorbs these).
+      - seen_count: listings successfully yielded.
+    A run is "completed" (safe to delist against) iff reached_terminal and
+    search_errors == 0 — that decision is made by the caller, not here."""
+    if outcome is None:
+        outcome = {}
+    outcome.setdefault('reached_terminal', False)
+    outcome.setdefault('search_errors', 0)
+    outcome.setdefault('detail_errors', 0)
+    outcome.setdefault('seen_count', 0)
+
     own = False
     if client is None:
         client = PoliteClient().__enter__()
@@ -164,6 +190,7 @@ def scrape_suburb(
 
     try:
         page = 1
+        consecutive_fail = 0
         while page <= max_pages:
             url = SEARCH_URL.format(suburb=suburb.lower())
             if page > 1:
@@ -172,18 +199,43 @@ def scrape_suburb(
                 html = client.get(url)
             except Exception as e:
                 _report('search', url, e)
-                # transient error on a search page — try the next page rather than abort
+                outcome['search_errors'] += 1
+                consecutive_fail += 1
+                if consecutive_fail >= MAX_CONSECUTIVE_SEARCH_FAIL:
+                    break  # invalid suburb or active block — stop hammering
                 page += 1
                 continue
-            urls = discover_listing_urls(html)
+            try:
+                urls = discover_listing_urls(html)
+            except Exception as e:
+                _report('search', url, e)
+                outcome['search_errors'] += 1
+                consecutive_fail += 1
+                if consecutive_fail >= MAX_CONSECUTIVE_SEARCH_FAIL:
+                    break
+                page += 1
+                continue
+            consecutive_fail = 0
             for detail_url in urls:
                 try:
                     detail_html = client.get(detail_url)
-                    yield parse_detail(detail_url, detail_html)
+                    parsed = parse_detail(detail_url, detail_html)
                 except Exception as e:
                     _report('detail', detail_url, e)
+                    outcome['detail_errors'] += 1
                     continue
-            if not has_next_page(html):
+                outcome['seen_count'] += 1
+                yield parsed
+            try:
+                more = has_next_page(html)
+            except Exception as e:
+                # Can't tell if there are more pages — count it as a search error
+                # (so the run is not 'completed') and stop here rather than guess.
+                _report('search', url, e)
+                outcome['search_errors'] += 1
+                break
+            if not more:
+                outcome['reached_terminal'] = True
                 break
             page += 1
     finally:

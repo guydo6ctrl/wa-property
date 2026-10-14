@@ -3,8 +3,9 @@ import dataclasses
 
 from django.core.management.base import BaseCommand
 from django.utils import timezone
+from django.utils.text import slugify
 
-from apps.listings.models import Listing
+from apps.listings.models import Listing, ScrapeRun
 from apps.listings.sites import reiwa
 from apps.listings.sites.common import PoliteClient
 
@@ -37,20 +38,24 @@ class Command(BaseCommand):
         n_total = 0
         n_created = 0
         n_errors = 0
-        n_reaped = 0
+        n_completed = 0
+        consecutive_blocked = 0   # suburbs in a row that returned nothing but errors
+        BLOCK_CIRCUIT_BREAK = 4   # ...this many ⇒ reiwa is blocking us; stop the run
         with client:
             for suburb in suburbs:
+                slug = slugify(suburb)
                 self.stdout.write(self.style.NOTICE(f'== {suburb} =='))
+                run = ScrapeRun.objects.create(suburb_slug=slug, started_at=timezone.now())
                 suburb_count = 0
-                seen_source_ids: set[str] = set()
+                outcome: dict = {}
                 suburb_failed = False
                 try:
                     for parsed in reiwa.scrape_suburb(
-                        suburb, client=client, max_pages=opts['max_pages'], on_error=on_error,
+                        suburb, client=client, max_pages=opts['max_pages'],
+                        on_error=on_error, outcome=outcome,
                     ):
                         n_total += 1
                         suburb_count += 1
-                        seen_source_ids.add(parsed.source_id)
                         fields = dataclasses.asdict(parsed)
                         fields.pop('source_id')
                         fields['raw'] = {}
@@ -58,7 +63,15 @@ class Command(BaseCommand):
                             obj, created = Listing.objects.update_or_create(
                                 source=Listing.SOURCE_REIWA,
                                 source_id=parsed.source_id,
-                                defaults={**fields, 'status': Listing.STATUS_ACTIVE, 'last_seen': timezone.now()},
+                                defaults={
+                                    **fields,
+                                    # Key the listing on its own (true) suburb, and
+                                    # reset the grace counter — it was just seen.
+                                    'suburb_slug': slugify(parsed.suburb),
+                                    'status': Listing.STATUS_ACTIVE,
+                                    'missed_scrapes': 0,
+                                    'last_seen': timezone.now(),
+                                },
                             )
                             n_created += int(created)
                             flag = '+' if created else '.'
@@ -72,23 +85,42 @@ class Command(BaseCommand):
                     suburb_failed = True
                     self.stderr.write(self.style.ERROR(f'  !! suburb {suburb!r} aborted: {type(e).__name__}: {e}'))
 
-                # Reap stale listings only if this suburb completed cleanly and we
-                # got a sane number of results — guards against silent reiwa errors
-                # that would otherwise mass-delete active listings.
-                if not suburb_failed and len(seen_source_ids) >= 5:
-                    reaped = (Listing.objects
-                              .filter(source=Listing.SOURCE_REIWA,
-                                      suburb__iexact=suburb,
-                                      status=Listing.STATUS_ACTIVE)
-                              .exclude(source_id__in=seen_source_ids)
-                              .update(status=Listing.STATUS_GONE,
-                                      last_seen=timezone.now()))
-                    if reaped:
-                        n_reaped += reaped
-                        self.stdout.write(f'   reaped {reaped} stale listings in {suburb}')
+                # Record the run. Deactivation is a separate stage (`delist`) that
+                # reads these rows — the scrape itself never marks anything gone.
+                # A run is trustworthy ("completed") only if it was fully traversed
+                # with no missing search page (a single detail miss is tolerated).
+                completed = (not suburb_failed
+                             and outcome.get('reached_terminal', False)
+                             and outcome.get('search_errors', 0) == 0)
+                run.finished_at = timezone.now()
+                run.reached_terminal = outcome.get('reached_terminal', False)
+                run.search_errors = outcome.get('search_errors', 0)
+                run.detail_errors = outcome.get('detail_errors', 0)
+                run.seen_count = outcome.get('seen_count', 0)
+                run.completed = completed
+                run.save()
+                n_completed += int(completed)
 
-                self.stdout.write(self.style.NOTICE(f'   ({suburb_count} from {suburb})'))
+                label = self.style.SUCCESS('completed') if completed else self.style.WARNING('INCOMPLETE')
+                self.stdout.write(self.style.NOTICE(
+                    f'   ({suburb_count} from {suburb}; {label}, '
+                    f'{run.search_errors} search-err / {run.detail_errors} detail-err)'))
+
+                # Circuit breaker: a suburb that yielded nothing but search errors is
+                # either invalid or blocked. Several in a row means reiwa is blocking
+                # this IP — stop rather than grind through the rest provoking it more.
+                if run.seen_count == 0 and run.search_errors > 0:
+                    consecutive_blocked += 1
+                    if consecutive_blocked >= BLOCK_CIRCUIT_BREAK:
+                        self.stderr.write(self.style.ERROR(
+                            f'!! Aborting: {consecutive_blocked} suburbs in a row returned '
+                            f'only errors — reiwa is likely blocking. Back off and retry later.'))
+                        break
+                else:
+                    consecutive_blocked = 0
 
         self.stdout.write(self.style.SUCCESS(
-            f'Done. {n_total} listings, {n_created} new, {n_reaped} reaped, {n_errors} errors.'
+            f'Done. {n_total} listings, {n_created} new, '
+            f'{n_completed}/{len(suburbs)} suburbs completed, {n_errors} errors.\n'
+            f'Run `python manage.py delist` to deactivate listings gone from completed scrapes.'
         ))

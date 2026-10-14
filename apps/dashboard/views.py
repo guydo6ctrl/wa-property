@@ -6,6 +6,7 @@ most-recent member's first_seen descending — newest pairs at the top."""
 from __future__ import annotations
 from collections import Counter
 from datetime import datetime
+from urllib.parse import urlencode
 
 from django.db import connection
 from django.shortcuts import render
@@ -18,7 +19,9 @@ def leads(request):
     with connection.cursor() as c:
         c.execute("""
             SELECT l.id, l.address_raw, l.suburb, l.price_text, l.url, l.first_seen,
-                   c.id, c.area_sqm, c.r_code
+                   c.id, c.area_sqm, c.r_code,
+                   c.raw->>'road_name', c.raw->>'locality',
+                   ST_Y(ST_Centroid(c.geom)), ST_X(ST_Centroid(c.geom))
             FROM listings_listing l
             JOIN cadastre_lot c ON c.id = l.lot_id
             WHERE l.status = 'active'
@@ -30,7 +33,7 @@ def leads(request):
 
     lot_to_member: dict[int, dict] = {}
     for (lid, addr, suburb, price, url, first_seen,
-         lot_id, area, r_code) in rows:
+         lot_id, area, r_code, road_name, locality, lat, lng) in rows:
         lot_to_member[lot_id] = {
             'listing_id': lid,
             'address': addr,
@@ -42,17 +45,26 @@ def leads(request):
             'lot_id': lot_id,
             'area_sqm': area,
             'r_code': r_code or '',
+            'road_name': road_name or '',
+            'lat': lat,
+            'lng': lng,
         }
     lot_ids = list(lot_to_member.keys())
 
     with connection.cursor() as c:
+        # Genuine neighbours only: two lots must share a real boundary edge,
+        # not merely be within a few metres (which scoops up across-street
+        # pairs and two-of-three subdivided siblings with a third lot in the
+        # gap) and not merely kiss at a corner point across an intersection.
         c.execute("""
             SELECT a.id, b.id
             FROM cadastre_lot a
             JOIN cadastre_lot b
               ON a.id < b.id
              AND a.id = ANY(%s) AND b.id = ANY(%s)
-             AND ST_DWithin(a.geom::geography, b.geom::geography, 5)
+             AND ST_Touches(a.geom, b.geom)
+             AND ST_Dimension(ST_Intersection(a.geom, b.geom)) = 1
+             AND ST_Length(ST_Intersection(a.geom, b.geom)::geography) >= 1
         """, [lot_ids, lot_ids])
         pairs = c.fetchall()
 
@@ -83,6 +95,22 @@ def leads(request):
         rcode_mixed = len(rcode_set) > 1
         rcode_label = ', '.join(rcode_set) if rcode_set else '—'
 
+        # Back-to-back: members front different streets (share a rear/side
+        # fence rather than sit side-by-side). Still genuine neighbours, but a
+        # through-block site — worth flagging so it can be eyeballed.
+        road_names = {m['road_name'] for m in members if m['road_name']}
+        back_to_back = len(road_names) > 1
+
+        # Link to the existing /lots/ Leaflet map, which highlights the lot
+        # polygons containing these centroid points and fits bounds to them.
+        map_url = '/lots/?' + urlencode({
+            'cluster_points': ';'.join(
+                f"{m['lat']:.6f},{m['lng']:.6f}" for m in members
+                if m['lat'] is not None and m['lng'] is not None),
+            'cluster_labels': '|'.join(m['address_short'] for m in members),
+            'cluster_name': suburb_label,
+        })
+
         gain = _yield_gain(members, total_area)
         newest = max(m['first_seen'] for m in members)
         days_new = (now - newest).days
@@ -93,6 +121,8 @@ def leads(request):
             'total_area': total_area,
             'rcode_label': rcode_label,
             'rcode_mixed': rcode_mixed,
+            'back_to_back': back_to_back,
+            'map_url': map_url,
             'gain': gain,
             'days_new': days_new,
             'newest_first_seen': newest,

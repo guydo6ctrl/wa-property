@@ -17,11 +17,18 @@
   .member a:hover { text-decoration: underline; }
   .price { color: #666; margin-left: 8px; }
   .mixed { color: #c66; font-weight: 600; }
+  .b2b { display: inline-block; margin-left: 6px; padding: 1px 6px; border-radius: 3px;
+         background: #eef2f7; color: #5a6b80; font-size: 11px; font-weight: 600;
+         text-transform: uppercase; letter-spacing: 0.4px; vertical-align: middle; }
   .days-new { color: #1e7f3e; font-weight: 600; }
   .days-old { color: #888; }
   .gain-pos { color: #1e7f3e; font-weight: 600; }
   .gain-zero { color: #888; }
   .empty { color: #888; font-style: italic; padding: 40px; text-align: center; }
+  .map-btn { display: inline-block; padding: 4px 10px; border: 1px solid #1e6fdf; border-radius: 4px;
+             color: #1e6fdf; text-decoration: none; font-size: 12px; font-weight: 600;
+             white-space: nowrap; }
+  .map-btn:hover { background: #1e6fdf; color: #fff; }
 </style>
 </head>
 <body>
@@ -40,12 +47,16 @@
       <th>R-code</th>
       <th>Yield gain</th>
       <th>Days new</th>
+      <th>Map</th>
     </tr>
   </thead>
   <tbody>
     {% for c in clusters %}
     <tr>
-      <td>{{ c.suburb }}</td>
+      <td>
+        {{ c.suburb }}
+        {% if c.back_to_back %}<span class="b2b" title="Members front different streets — share a rear/side boundary">back-to-back</span>{% endif %}
+      </td>
       <td class="members">
         {% for m in c.members %}
           <span class="member">
@@ -76,6 +87,9 @@
         {% else %}
           <span class="days-old">{{ c.days_new }}d</span>
         {% endif %}
+      </td>
+      <td>
+        <a class="map-btn" href="{{ c.map_url }}" target="_blank" rel="noopener">🗺 Map</a>
       </td>
     </tr>
     {% endfor %}

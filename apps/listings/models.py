@@ -46,6 +46,12 @@ class Listing(models.Model):
 
     raw = models.JSONField(default=dict, blank=True)
 
+    # Delisting: suburb_slug is slugify(suburb) — the listing's own (true) suburb,
+    # the stable key the `delist` sweep groups on. missed_scrapes counts completed
+    # scrapes of that suburb in which this listing was absent; reaped to `gone` at 2.
+    suburb_slug = models.CharField(max_length=64, blank=True, db_index=True)
+    missed_scrapes = models.PositiveSmallIntegerField(default=0)
+
     first_seen = models.DateTimeField(auto_now_add=True)
     last_seen = models.DateTimeField(auto_now=True)
     status = models.CharField(max_length=8, choices=STATUS_CHOICES, default=STATUS_ACTIVE)
@@ -56,3 +62,31 @@ class Listing(models.Model):
 
     def __str__(self):
         return f'{self.address_raw} ({self.source}:{self.source_id})'
+
+
+class ScrapeRun(models.Model):
+    """One row per suburb scrape — the persisted record the `delist` sweep reads.
+
+    `completed` (reached_terminal AND search_errors == 0) means the suburb was
+    fully traversed with no missing search page, so a listing absent from it can
+    be trusted as gone. `last_seen >= started_at` encodes "seen this run" (no need
+    to store source-id sets). `delisted_at` marks a run the sweep has consumed."""
+    suburb_slug = models.CharField(max_length=64, db_index=True)
+    started_at = models.DateTimeField()
+    finished_at = models.DateTimeField(null=True, blank=True)
+
+    reached_terminal = models.BooleanField(default=False)
+    search_errors = models.PositiveSmallIntegerField(default=0)
+    detail_errors = models.PositiveSmallIntegerField(default=0)
+    seen_count = models.PositiveIntegerField(default=0)
+    completed = models.BooleanField(default=False)
+
+    delisted_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        indexes = [models.Index(fields=['completed', 'delisted_at'])]
+
+    def __str__(self):
+        flag = 'completed' if self.completed else 'incomplete'
+        return f'{self.suburb_slug} @ {self.started_at:%Y-%m-%d %H:%M} ({flag}, {self.seen_count} seen)'
+
